@@ -9,7 +9,6 @@ import argparse
 import unittest
 
 import torch
-from torch.autograd import Variable
 
 from fairseq.sequence_generator import SequenceGenerator
 
@@ -29,11 +28,11 @@ class TestSequenceGenerator(unittest.TestCase):
         self.w2 = 5
 
         # construct source data
-        self.src_tokens = Variable(torch.LongTensor([
+        self.src_tokens = torch.LongTensor([
             [self.w1, self.w2, self.eos],
             [self.w1, self.w2, self.eos],
-        ]))
-        self.src_lengths = Variable(torch.LongTensor([2, 2]))
+        ])
+        self.src_lengths = torch.LongTensor([2, 2])
 
         args = argparse.Namespace()
         unk = 0.
@@ -80,10 +79,12 @@ class TestSequenceGenerator(unittest.TestCase):
             ]),
         ]
 
-        self.model = test_utils.TestModel.build_model(args, d, d)
+        task = test_utils.TestTranslationTask.setup_task(args, d, d)
+        self.model = task.build_model(args)
+        self.tgt_dict = task.target_dictionary
 
     def test_with_normalization(self):
-        generator = SequenceGenerator([self.model])
+        generator = SequenceGenerator([self.model], self.tgt_dict)
         hypos = generator.generate(self.src_tokens, self.src_lengths, beam_size=2)
         eos, w1, w2 = self.eos, self.w1, self.w2
         # sentence 1, beam 1
@@ -102,7 +103,7 @@ class TestSequenceGenerator(unittest.TestCase):
     def test_without_normalization(self):
         # Sentence 1: unchanged from the normalized case
         # Sentence 2: beams swap order
-        generator = SequenceGenerator([self.model], normalize_scores=False)
+        generator = SequenceGenerator([self.model], self.tgt_dict, normalize_scores=False)
         hypos = generator.generate(self.src_tokens, self.src_lengths, beam_size=2)
         eos, w1, w2 = self.eos, self.w1, self.w2
         # sentence 1, beam 1
@@ -120,7 +121,7 @@ class TestSequenceGenerator(unittest.TestCase):
 
     def test_with_lenpen_favoring_short_hypos(self):
         lenpen = 0.6
-        generator = SequenceGenerator([self.model], len_penalty=lenpen)
+        generator = SequenceGenerator([self.model], self.tgt_dict, len_penalty=lenpen)
         hypos = generator.generate(self.src_tokens, self.src_lengths, beam_size=2)
         eos, w1, w2 = self.eos, self.w1, self.w2
         # sentence 1, beam 1
@@ -138,7 +139,7 @@ class TestSequenceGenerator(unittest.TestCase):
 
     def test_with_lenpen_favoring_long_hypos(self):
         lenpen = 5.0
-        generator = SequenceGenerator([self.model], len_penalty=lenpen)
+        generator = SequenceGenerator([self.model], self.tgt_dict, len_penalty=lenpen)
         hypos = generator.generate(self.src_tokens, self.src_lengths, beam_size=2)
         eos, w1, w2 = self.eos, self.w1, self.w2
         # sentence 1, beam 1
@@ -155,7 +156,7 @@ class TestSequenceGenerator(unittest.TestCase):
         self.assertHypoScore(hypos[1][1], [0.7, 0.4, 0.6], lenpen=lenpen)
 
     def test_maxlen(self):
-        generator = SequenceGenerator([self.model], maxlen=2)
+        generator = SequenceGenerator([self.model], self.tgt_dict, maxlen=2)
         hypos = generator.generate(self.src_tokens, self.src_lengths, beam_size=2)
         eos, w1, w2 = self.eos, self.w1, self.w2
         # sentence 1, beam 1
@@ -172,7 +173,7 @@ class TestSequenceGenerator(unittest.TestCase):
         self.assertHypoScore(hypos[1][1], [0.3, 0.9, 0.01])
 
     def test_no_stop_early(self):
-        generator = SequenceGenerator([self.model], stop_early=False)
+        generator = SequenceGenerator([self.model], self.tgt_dict, stop_early=False)
         hypos = generator.generate(self.src_tokens, self.src_lengths, beam_size=2)
         eos, w1, w2 = self.eos, self.w1, self.w2
         # sentence 1, beam 1

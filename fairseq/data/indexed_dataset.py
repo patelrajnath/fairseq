@@ -5,9 +5,10 @@
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
 
-import numpy as np
 import os
 import struct
+
+import numpy as np
 import torch
 
 from fairseq.tokenizer import Tokenizer
@@ -48,10 +49,12 @@ def data_file_path(prefix_path):
     return prefix_path + '.bin'
 
 
-class IndexedDataset(object):
+class IndexedDataset(torch.utils.data.Dataset):
     """Loader for TorchNet IndexedDataset"""
 
-    def __init__(self, path):
+    def __init__(self, path, fix_lua_indexing=False):
+        super().__init__()
+        self.fix_lua_indexing = fix_lua_indexing
         with open(index_file_path(path), 'rb') as f:
             magic = f.read(8)
             assert magic == b'TNTIDX\x00\x00'
@@ -81,7 +84,10 @@ class IndexedDataset(object):
         a = np.empty(tensor_size, dtype=self.dtype)
         self.data_file.seek(self.data_offsets[i] * self.element_size)
         self.data_file.readinto(a)
-        return torch.from_numpy(a)
+        item = torch.from_numpy(a).long()
+        if self.fix_lua_indexing:
+            item -= 1  # subtract 1 for 0-based indexing
+        return item
 
     def __len__(self):
         return self.size
@@ -102,6 +108,8 @@ class IndexedInMemoryDataset(IndexedDataset):
         self.buffer = np.empty(self.data_offsets[-1], dtype=self.dtype)
         self.data_file.readinto(self.buffer)
         self.data_file.close()
+        if self.fix_lua_indexing:
+            self.buffer -= 1  # subtract 1 for 0-based indexing
 
     def __del__(self):
         pass
@@ -111,7 +119,7 @@ class IndexedInMemoryDataset(IndexedDataset):
         tensor_size = self.sizes[self.dim_offsets[i]:self.dim_offsets[i + 1]]
         a = np.empty(tensor_size, dtype=self.dtype)
         np.copyto(a, self.buffer[self.data_offsets[i]:self.data_offsets[i + 1]])
-        return torch.from_numpy(a)
+        return torch.from_numpy(a).long()
 
 
 class IndexedRawTextDataset(IndexedDataset):
@@ -134,7 +142,7 @@ class IndexedRawTextDataset(IndexedDataset):
                 tokens = Tokenizer.tokenize(
                     line, dictionary, add_if_not_exist=False,
                     append_eos=self.append_eos, reverse_order=self.reverse_order,
-                ) + 1  # +1 for Lua compatibility
+                ).long()
                 self.tokens_list.append(tokens)
                 self.sizes.append(len(tokens))
         self.sizes = np.array(self.sizes)
@@ -153,12 +161,15 @@ class IndexedRawTextDataset(IndexedDataset):
     def __len__(self):
         return self.size
 
+    @staticmethod
+    def exists(path):
+        return os.path.exists(path)
+
 
 class IndexedDatasetBuilder(object):
-
     element_sizes = {
         np.uint8: 1,
-        np.int8:  1,
+        np.int8: 1,
         np.int16: 2,
         np.int32: 4,
         np.int64: 8,
@@ -187,10 +198,8 @@ class IndexedDatasetBuilder(object):
         index = open(index_file, 'wb')
         index.write(b'TNTIDX\x00\x00')
         index.write(struct.pack('<Q', 1))
-        index.write(struct.pack('<QQ', code(self.dtype),
-                                self.element_size))
-        index.write(struct.pack('<QQ', len(self.data_offsets) - 1,
-                                len(self.sizes)))
+        index.write(struct.pack('<QQ', code(self.dtype), self.element_size))
+        index.write(struct.pack('<QQ', len(self.data_offsets) - 1, len(self.sizes)))
         write_longs(index, self.dim_offsets)
         write_longs(index, self.data_offsets)
         write_longs(index, self.sizes)

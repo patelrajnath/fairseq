@@ -6,14 +6,15 @@
 # can be found in the PATENTS file in the same directory.
 
 import torch
-from torch.autograd import Variable
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fairseq import utils
-from fairseq.data import LanguagePairDataset
+from fairseq import options, utils
 
-from . import FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model, register_model_architecture
+from . import (
+    FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model,
+    register_model_architecture,
+)
 
 
 @register_model('lstm')
@@ -24,18 +25,24 @@ class LSTMModel(FairseqModel):
     @staticmethod
     def add_args(parser):
         """Add model-specific arguments to the parser."""
-        parser.add_argument('--dropout', default=0.1, type=float, metavar='D',
+        parser.add_argument('--dropout', type=float, metavar='D',
                             help='dropout probability')
         parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
                             help='encoder embedding dimension')
-        parser.add_argument('--encoder-embed-path', default=None, type=str, metavar='STR',
+        parser.add_argument('--encoder-embed-path', type=str, metavar='STR',
                             help='path to pre-trained encoder embedding')
+        parser.add_argument('--encoder-hidden-size', type=int, metavar='N',
+                            help='encoder hidden size')
         parser.add_argument('--encoder-layers', type=int, metavar='N',
                             help='number of encoder layers')
+        parser.add_argument('--encoder-bidirectional', action='store_true',
+                            help='make all layers of encoder bidirectional')
         parser.add_argument('--decoder-embed-dim', type=int, metavar='N',
                             help='decoder embedding dimension')
-        parser.add_argument('--decoder-embed-path', default=None, type=str, metavar='STR',
+        parser.add_argument('--decoder-embed-path', type=str, metavar='STR',
                             help='path to pre-trained decoder embedding')
+        parser.add_argument('--decoder-hidden-size', type=int, metavar='N',
+                            help='decoder hidden size')
         parser.add_argument('--decoder-layers', type=int, metavar='N',
                             help='number of decoder layers')
         parser.add_argument('--decoder-out-embed-dim', type=int, metavar='N',
@@ -54,74 +61,94 @@ class LSTMModel(FairseqModel):
                             help='dropout probability for decoder output')
 
     @classmethod
-    def build_model(cls, args, src_dict, dst_dict):
+    def build_model(cls, args, task):
         """Build a new model instance."""
-        if not hasattr(args, 'encoder_embed_path'):
-            args.encoder_embed_path = None
-        if not hasattr(args, 'decoder_embed_path'):
-            args.decoder_embed_path = None
+        # make sure that all args are properly defaulted (in case there are any new ones)
+        base_architecture(args)
 
-        encoder_embed_dict = None
+        def load_pretrained_embedding_from_file(embed_path, dictionary, embed_dim):
+            num_embeddings = len(dictionary)
+            padding_idx = dictionary.pad()
+            embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
+            embed_dict = utils.parse_embedding(embed_path)
+            utils.print_embed_overlap(embed_dict, dictionary)
+            return utils.load_embedding(embed_dict, dictionary, embed_tokens)
+
+        pretrained_encoder_embed = None
         if args.encoder_embed_path:
-            encoder_embed_dict = utils.parse_embedding(args.encoder_embed_path)
-            utils.print_embed_overlap(encoder_embed_dict, src_dict)
-
-        decoder_embed_dict = None
+            pretrained_encoder_embed = load_pretrained_embedding_from_file(
+                args.encoder_embed_path, task.source_dictionary, args.encoder_embed_dim)
+        pretrained_decoder_embed = None
         if args.decoder_embed_path:
-            decoder_embed_dict = utils.parse_embedding(args.decoder_embed_path)
-            utils.print_embed_overlap(decoder_embed_dict, dst_dict)
+            pretrained_decoder_embed = load_pretrained_embedding_from_file(
+                args.decoder_embed_path, task.target_dictionary, args.decoder_embed_dim)
 
         encoder = LSTMEncoder(
-            src_dict,
+            dictionary=task.source_dictionary,
             embed_dim=args.encoder_embed_dim,
-            embed_dict=encoder_embed_dict,
+            hidden_size=args.encoder_hidden_size,
             num_layers=args.encoder_layers,
             dropout_in=args.encoder_dropout_in,
             dropout_out=args.encoder_dropout_out,
+            bidirectional=args.encoder_bidirectional,
+            pretrained_embed=pretrained_encoder_embed,
         )
         decoder = LSTMDecoder(
-            dst_dict,
-            encoder_embed_dim=args.encoder_embed_dim,
+            dictionary=task.target_dictionary,
             embed_dim=args.decoder_embed_dim,
-            embed_dict=decoder_embed_dict,
+            hidden_size=args.decoder_hidden_size,
             out_embed_dim=args.decoder_out_embed_dim,
             num_layers=args.decoder_layers,
-            attention=bool(eval(args.decoder_attention)),
             dropout_in=args.decoder_dropout_in,
             dropout_out=args.decoder_dropout_out,
+            attention=options.eval_bool(args.decoder_attention),
+            encoder_embed_dim=args.encoder_embed_dim,
+            encoder_output_units=encoder.output_units,
+            pretrained_embed=pretrained_decoder_embed,
         )
         return cls(encoder, decoder)
 
 
 class LSTMEncoder(FairseqEncoder):
     """LSTM encoder."""
-    def __init__(self, dictionary, embed_dim=512, embed_dict=None,
-                 num_layers=1, dropout_in=0.1, dropout_out=0.1):
+    def __init__(
+        self, dictionary, embed_dim=512, hidden_size=512, num_layers=1,
+        dropout_in=0.1, dropout_out=0.1, bidirectional=False,
+        left_pad=True, pretrained_embed=None, padding_value=0.,
+    ):
         super().__init__(dictionary)
         self.num_layers = num_layers
         self.dropout_in = dropout_in
         self.dropout_out = dropout_out
+        self.bidirectional = bidirectional
+        self.hidden_size = hidden_size
 
         num_embeddings = len(dictionary)
         self.padding_idx = dictionary.pad()
-        self.embed_tokens = Embedding(num_embeddings, embed_dim, self.padding_idx)
-        if embed_dict:
-            self.embed_tokens = utils.load_embedding(embed_dict, self.dictionary, self.embed_tokens)
+        if pretrained_embed is None:
+            self.embed_tokens = Embedding(num_embeddings, embed_dim, self.padding_idx)
+        else:
+            self.embed_tokens = pretrained_embed
 
         self.lstm = LSTM(
             input_size=embed_dim,
-            hidden_size=embed_dim,
+            hidden_size=hidden_size,
             num_layers=num_layers,
-            dropout=self.dropout_out,
-            bidirectional=False,
+            dropout=self.dropout_out if num_layers > 1 else 0.,
+            bidirectional=bidirectional,
         )
+        self.left_pad = left_pad
+        self.padding_value = padding_value
+
+        self.output_units = hidden_size
+        if bidirectional:
+            self.output_units *= 2
 
     def forward(self, src_tokens, src_lengths):
-        if LanguagePairDataset.LEFT_PAD_SOURCE:
+        if self.left_pad:
             # convert left-padding to right-padding
             src_tokens = utils.convert_padding_direction(
                 src_tokens,
-                src_lengths,
                 self.padding_idx,
                 left_to_right=True,
             )
@@ -131,7 +158,6 @@ class LSTMEncoder(FairseqEncoder):
         # embed tokens
         x = self.embed_tokens(src_tokens)
         x = F.dropout(x, p=self.dropout_in, training=self.training)
-        embed_dim = x.size(2)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -140,19 +166,46 @@ class LSTMEncoder(FairseqEncoder):
         packed_x = nn.utils.rnn.pack_padded_sequence(x, src_lengths.data.tolist())
 
         # apply LSTM
-        h0 = Variable(x.data.new(self.num_layers, bsz, embed_dim).zero_())
-        c0 = Variable(x.data.new(self.num_layers, bsz, embed_dim).zero_())
-        packed_outs, (final_hiddens, final_cells) = self.lstm(
-            packed_x,
-            (h0, c0),
-        )
+        if self.bidirectional:
+            state_size = 2 * self.num_layers, bsz, self.hidden_size
+        else:
+            state_size = self.num_layers, bsz, self.hidden_size
+        h0 = x.data.new(*state_size).zero_()
+        c0 = x.data.new(*state_size).zero_()
+        packed_outs, (final_hiddens, final_cells) = self.lstm(packed_x, (h0, c0))
 
         # unpack outputs and apply dropout
-        x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=0.)
+        x, _ = nn.utils.rnn.pad_packed_sequence(packed_outs, padding_value=self.padding_value)
         x = F.dropout(x, p=self.dropout_out, training=self.training)
-        assert list(x.size()) == [seqlen, bsz, embed_dim]
+        assert list(x.size()) == [seqlen, bsz, self.output_units]
 
-        return x, final_hiddens, final_cells
+        if self.bidirectional:
+
+            def combine_bidir(outs):
+                return torch.cat([
+                    torch.cat([outs[2 * i], outs[2 * i + 1]], dim=0).view(1, bsz, self.output_units)
+                    for i in range(self.num_layers)
+                ], dim=0)
+
+            final_hiddens = combine_bidir(final_hiddens)
+            final_cells = combine_bidir(final_cells)
+
+        encoder_padding_mask = src_tokens.eq(self.padding_idx).t()
+
+        return {
+            'encoder_out': (x, final_hiddens, final_cells),
+            'encoder_padding_mask': encoder_padding_mask if encoder_padding_mask.any() else None
+        }
+
+    def reorder_encoder_out(self, encoder_out_dict, new_order):
+        encoder_out_dict['encoder_out'] = tuple(
+            eo.index_select(1, new_order)
+            for eo in encoder_out_dict['encoder_out']
+        )
+        if encoder_out_dict['encoder_padding_mask'] is not None:
+            encoder_out_dict['encoder_padding_mask'] = \
+                encoder_out_dict['encoder_padding_mask'].index_select(1, new_order)
+        return encoder_out_dict
 
     def max_positions(self):
         """Maximum input length supported by the encoder."""
@@ -166,7 +219,7 @@ class AttentionLayer(nn.Module):
         self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
         self.output_proj = Linear(2*output_embed_dim, output_embed_dim, bias=False)
 
-    def forward(self, input, source_hids):
+    def forward(self, input, source_hids, encoder_padding_mask):
         # input: bsz x input_embed_dim
         # source_hids: srclen x bsz x output_embed_dim
 
@@ -175,7 +228,15 @@ class AttentionLayer(nn.Module):
 
         # compute attention
         attn_scores = (source_hids * x.unsqueeze(0)).sum(dim=2)
-        attn_scores = F.softmax(attn_scores.t(), dim=1).t()  # srclen x bsz
+
+        # don't attend over padding
+        if encoder_padding_mask is not None:
+            attn_scores = attn_scores.float().masked_fill_(
+                encoder_padding_mask,
+                float('-inf')
+            ).type_as(attn_scores)  # FP16 support: cast to float and back
+
+        attn_scores = F.softmax(attn_scores, dim=0)  # srclen x bsz
 
         # sum weighted sources
         x = (attn_scores.unsqueeze(2) * source_hids).sum(dim=0)
@@ -186,42 +247,55 @@ class AttentionLayer(nn.Module):
 
 class LSTMDecoder(FairseqIncrementalDecoder):
     """LSTM decoder."""
-    def __init__(self, dictionary, encoder_embed_dim=512,
-                 embed_dim=512, embed_dict=None,
-                 out_embed_dim=512, num_layers=1, dropout_in=0.1,
-                 dropout_out=0.1, attention=True):
+    def __init__(
+        self, dictionary, embed_dim=512, hidden_size=512, out_embed_dim=512,
+        num_layers=1, dropout_in=0.1, dropout_out=0.1, attention=True,
+        encoder_embed_dim=512, encoder_output_units=512, pretrained_embed=None,
+    ):
         super().__init__(dictionary)
         self.dropout_in = dropout_in
         self.dropout_out = dropout_out
+        self.hidden_size = hidden_size
 
         num_embeddings = len(dictionary)
         padding_idx = dictionary.pad()
-        self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
-        if embed_dict:
-            self.embed_tokens = utils.load_embedding(embed_dict, self.dictionary, self.embed_tokens)
+        if pretrained_embed is None:
+            self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
+        else:
+            self.embed_tokens = pretrained_embed
+
+        self.encoder_output_units = encoder_output_units
+        assert encoder_output_units == hidden_size, \
+            'encoder_output_units ({}) != hidden_size ({})'.format(encoder_output_units, hidden_size)
+        # TODO another Linear layer if not equal
 
         self.layers = nn.ModuleList([
-            LSTMCell(encoder_embed_dim + embed_dim if layer == 0 else embed_dim, embed_dim)
+            LSTMCell(
+                input_size=encoder_output_units + embed_dim if layer == 0 else hidden_size,
+                hidden_size=hidden_size,
+            )
             for layer in range(num_layers)
         ])
-        self.attention = AttentionLayer(encoder_embed_dim, embed_dim) if attention else None
-        if embed_dim != out_embed_dim:
-            self.additional_fc = Linear(embed_dim, out_embed_dim)
+        self.attention = AttentionLayer(encoder_output_units, hidden_size) if attention else None
+        if hidden_size != out_embed_dim:
+            self.additional_fc = Linear(hidden_size, out_embed_dim)
         self.fc_out = Linear(out_embed_dim, num_embeddings, dropout=dropout_out)
 
-    def forward(self, prev_output_tokens, encoder_out, incremental_state=None):
+    def forward(self, prev_output_tokens, encoder_out_dict, incremental_state=None):
+        encoder_out = encoder_out_dict['encoder_out']
+        encoder_padding_mask = encoder_out_dict['encoder_padding_mask']
+
         if incremental_state is not None:
             prev_output_tokens = prev_output_tokens[:, -1:]
         bsz, seqlen = prev_output_tokens.size()
 
         # get outputs from encoder
-        encoder_outs, _, _ = encoder_out
+        encoder_outs, _, _ = encoder_out[:3]
         srclen = encoder_outs.size(0)
 
         # embed tokens
         x = self.embed_tokens(prev_output_tokens)
         x = F.dropout(x, p=self.dropout_in, training=self.training)
-        embed_dim = x.size(2)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -231,13 +305,13 @@ class LSTMDecoder(FairseqIncrementalDecoder):
         if cached_state is not None:
             prev_hiddens, prev_cells, input_feed = cached_state
         else:
-            _, encoder_hiddens, encoder_cells = encoder_out
+            _, encoder_hiddens, encoder_cells = encoder_out[:3]
             num_layers = len(self.layers)
             prev_hiddens = [encoder_hiddens[i] for i in range(num_layers)]
             prev_cells = [encoder_cells[i] for i in range(num_layers)]
-            input_feed = Variable(x.data.new(bsz, embed_dim).zero_())
+            input_feed = x.data.new(bsz, self.encoder_output_units).zero_()
 
-        attn_scores = Variable(x.data.new(srclen, seqlen, bsz).zero_())
+        attn_scores = x.data.new(srclen, seqlen, bsz).zero_()
         outs = []
         for j in range(seqlen):
             # input feeding: concatenate context vector from previous time step
@@ -256,7 +330,7 @@ class LSTMDecoder(FairseqIncrementalDecoder):
 
             # apply attention using the last layer's hidden state
             if self.attention is not None:
-                out, attn_scores[:, j, :] = self.attention(hidden, encoder_outs)
+                out, attn_scores[:, j, :] = self.attention(hidden, encoder_outs, encoder_padding_mask)
             else:
                 out = hidden
             out = F.dropout(out, p=self.dropout_out, training=self.training)
@@ -272,7 +346,7 @@ class LSTMDecoder(FairseqIncrementalDecoder):
             self, incremental_state, 'cached_state', (prev_hiddens, prev_cells, input_feed))
 
         # collect outputs across time steps
-        x = torch.cat(outs, dim=0).view(seqlen, bsz, embed_dim)
+        x = torch.cat(outs, dim=0).view(seqlen, bsz, self.hidden_size)
 
         # T x B x C -> B x T x C
         x = x.transpose(1, 0)
@@ -289,6 +363,7 @@ class LSTMDecoder(FairseqIncrementalDecoder):
         return x, attn_scores
 
     def reorder_incremental_state(self, incremental_state, new_order):
+        super().reorder_incremental_state(incremental_state, new_order)
         cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
         if cached_state is None:
             return
@@ -298,8 +373,6 @@ class LSTMDecoder(FairseqIncrementalDecoder):
                 return [reorder_state(state_i) for state_i in state]
             return state.index_select(0, new_order)
 
-        if not isinstance(new_order, Variable):
-            new_order = Variable(new_order)
         new_state = tuple(map(reorder_state, cached_state))
         utils.set_incremental_state(self, incremental_state, 'cached_state', new_state)
 
@@ -310,7 +383,8 @@ class LSTMDecoder(FairseqIncrementalDecoder):
 
 def Embedding(num_embeddings, embedding_dim, padding_idx):
     m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
-    m.weight.data.uniform_(-0.1, 0.1)
+    nn.init.uniform_(m.weight, -0.1, 0.1)
+    nn.init.constant_(m.weight[padding_idx], 0)
     return m
 
 
@@ -341,40 +415,44 @@ def Linear(in_features, out_features, bias=True, dropout=0):
 
 @register_model_architecture('lstm', 'lstm')
 def base_architecture(args):
+    args.dropout = getattr(args, 'dropout', 0.1)
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
+    args.encoder_embed_path = getattr(args, 'encoder_embed_path', None)
+    args.encoder_hidden_size = getattr(args, 'encoder_hidden_size', args.encoder_embed_dim)
     args.encoder_layers = getattr(args, 'encoder_layers', 1)
+    args.encoder_bidirectional = getattr(args, 'encoder_bidirectional', False)
     args.encoder_dropout_in = getattr(args, 'encoder_dropout_in', args.dropout)
     args.encoder_dropout_out = getattr(args, 'encoder_dropout_out', args.dropout)
     args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 512)
+    args.decoder_embed_path = getattr(args, 'decoder_embed_path', None)
+    args.decoder_hidden_size = getattr(args, 'decoder_hidden_size', args.decoder_embed_dim)
     args.decoder_layers = getattr(args, 'decoder_layers', 1)
     args.decoder_out_embed_dim = getattr(args, 'decoder_out_embed_dim', 512)
-    args.decoder_attention = getattr(args, 'decoder_attention', True)
+    args.decoder_attention = getattr(args, 'decoder_attention', '1')
     args.decoder_dropout_in = getattr(args, 'decoder_dropout_in', args.dropout)
     args.decoder_dropout_out = getattr(args, 'decoder_dropout_out', args.dropout)
 
 
 @register_model_architecture('lstm', 'lstm_wiseman_iwslt_de_en')
 def lstm_wiseman_iwslt_de_en(args):
+    args.dropout = getattr(args, 'dropout', 0.1)
+    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 256)
+    args.encoder_dropout_in = getattr(args, 'encoder_dropout_in', 0)
+    args.encoder_dropout_out = getattr(args, 'encoder_dropout_out', 0)
+    args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 256)
+    args.decoder_out_embed_dim = getattr(args, 'decoder_out_embed_dim', 256)
+    args.decoder_dropout_in = getattr(args, 'decoder_dropout_in', 0)
+    args.decoder_dropout_out = getattr(args, 'decoder_dropout_out', args.dropout)
     base_architecture(args)
-    args.encoder_embed_dim = 256
-    args.encoder_layers = 1
-    args.encoder_dropout_in = 0
-    args.encoder_dropout_out = 0
-    args.decoder_embed_dim = 256
-    args.decoder_layers = 1
-    args.decoder_out_embed_dim = 256
-    args.decoder_attention = True
-    args.decoder_dropout_in = 0
 
 
 @register_model_architecture('lstm', 'lstm_luong_wmt_en_de')
 def lstm_luong_wmt_en_de(args):
+    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 1000)
+    args.encoder_layers = getattr(args, 'encoder_layers', 4)
+    args.encoder_dropout_out = getattr(args, 'encoder_dropout_out', 0)
+    args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 1000)
+    args.decoder_layers = getattr(args, 'decoder_layers', 4)
+    args.decoder_out_embed_dim = getattr(args, 'decoder_out_embed_dim', 1000)
+    args.decoder_dropout_out = getattr(args, 'decoder_dropout_out', 0)
     base_architecture(args)
-    args.encoder_embed_dim = 1000
-    args.encoder_layers = 4
-    args.encoder_dropout_out = 0
-    args.decoder_embed_dim = 1000
-    args.decoder_layers = 4
-    args.decoder_out_embed_dim = 1000
-    args.decoder_attention = True
-    args.decoder_dropout_out = 0

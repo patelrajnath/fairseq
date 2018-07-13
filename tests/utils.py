@@ -6,22 +6,24 @@
 # can be found in the PATENTS file in the same directory.
 
 import torch
-from torch.autograd import Variable
 
-from fairseq import data, dictionary, utils
+from fairseq import utils
+from fairseq.data import Dictionary
+from fairseq.data.language_pair_dataset import collate
 from fairseq.models import (
     FairseqEncoder,
     FairseqIncrementalDecoder,
     FairseqModel,
 )
+from fairseq.tasks import FairseqTask
 
 
 def dummy_dictionary(vocab_size, prefix='token_'):
-    d = dictionary.Dictionary()
+    d = Dictionary()
     for i in range(vocab_size):
         token = prefix + str(i)
         d.add_symbol(token)
-    d.finalize()
+    d.finalize(padding_factor=1)  # don't add extra padding symbols
     return d
 
 
@@ -44,13 +46,7 @@ def dummy_dataloader(
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        collate_fn=(
-            lambda samples: data.LanguagePairDataset.collate(
-                samples,
-                padding_idx,
-                eos_idx,
-            )
-        ),
+        collate_fn=(lambda samples: collate(samples, padding_idx, eos_idx)),
     )
     return iter(dataloader)
 
@@ -68,14 +64,38 @@ class TestDataset(torch.utils.data.Dataset):
         return len(self.data)
 
 
+class TestTranslationTask(FairseqTask):
+
+    def __init__(self, args, src_dict, tgt_dict, model):
+        super().__init__(args)
+        self.src_dict = src_dict
+        self.tgt_dict = tgt_dict
+        self.model = model
+
+    @classmethod
+    def setup_task(cls, args, src_dict=None, tgt_dict=None, model=None):
+        return cls(args, src_dict, tgt_dict, model)
+
+    def build_model(self, args):
+        return TestModel.build_model(args, self)
+
+    @property
+    def source_dictionary(self):
+        return self.src_dict
+
+    @property
+    def target_dictionary(self):
+        return self.tgt_dict
+
+
 class TestModel(FairseqModel):
     def __init__(self, encoder, decoder):
         super().__init__(encoder, decoder)
 
     @classmethod
-    def build_model(cls, args, src_dict, dst_dict):
-        encoder = TestEncoder(args, src_dict)
-        decoder = TestIncrementalDecoder(args, dst_dict)
+    def build_model(cls, args, task):
+        encoder = TestEncoder(args, task.source_dictionary)
+        decoder = TestIncrementalDecoder(args, task.target_dictionary)
         return cls(encoder, decoder)
 
 
@@ -86,6 +106,9 @@ class TestEncoder(FairseqEncoder):
 
     def forward(self, src_tokens, src_lengths):
         return src_tokens
+
+    def reorder_encoder_out(self, encoder_out, new_order):
+        return encoder_out.index_select(0, new_order)
 
 
 class TestIncrementalDecoder(FairseqIncrementalDecoder):
@@ -130,11 +153,11 @@ class TestIncrementalDecoder(FairseqIncrementalDecoder):
                     probs[:, i, self.dictionary.eos()] = 1.0
 
         # random attention
-        attn = torch.rand(bbsz, src_len, tgt_len)
+        attn = torch.rand(bbsz, tgt_len, src_len)
 
-        return Variable(probs), Variable(attn)
+        return probs, attn
 
-    def get_normalized_probs(self, net_output, log_probs):
+    def get_normalized_probs(self, net_output, log_probs, _):
         # the decoder returns probabilities directly
         probs = net_output[0]
         if log_probs:
